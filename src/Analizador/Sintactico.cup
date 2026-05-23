@@ -1,0 +1,459 @@
+/*
+ * ================================================================
+ *  CORONIX — Analizador Sintáctico y Semántico
+ *  Archivo : Sintactico.cup
+ *  Paquete : Analizador
+ *
+ *  Gramática del lenguaje Coronix (BNF):
+ *
+ *  <programa>    → <lista_sent> | ε
+ *  <lista_sent>  → <lista_sent> <sentencia> | <sentencia>
+ *
+ *  <sentencia>   → cuarto ID => <expr> !!
+ *                | media  ID => <expr> !!
+ *                | mega   ID => <expr> !!
+ *                | cuarto ID => <expr> !! break      (break explícito)
+ *                | media  ID => <expr> !! break
+ *                | mega   ID => <expr> !! break
+ *                | try { <lista_sent> }              (bloque try)
+ *                | try { }
+ *                | if ( <condicion> ) { <lista_sent> }  (bloque if)
+ *                | if ( <condicion> ) { }
+ *
+ *  <condicion>   → <expr> >= <expr>
+ *                | <expr> <= <expr>
+ *                | <expr> == <expr>
+ *                | <expr> != <expr>
+ *                | <expr> >  <expr>
+ *                | <expr> <  <expr>
+ *
+ *  <expr>        → <expr> @ <expr>      (suma / concat)
+ *                | <expr> ~ <expr>      (resta)
+ *                | <expr> # <expr>      (multiplicación)
+ *                | <expr> % <expr>      (división)
+ *                | ( <expr> )
+ *                | LIT_ENTERO
+ *                | LIT_DECIMAL
+ *                | LIT_CADENA
+ *                | ID
+ *
+ *  Cuádrupla G = (Vn, Vt, P, S):
+ *    Vn = { programa, lista_sent, sentencia, condicion, expr }
+ *    Vt = { cuarto, media, mega, if, try, break, ID,
+ *           =>, @, ~, #, %, !!, (, ), {, },
+ *           >=, <=, ==, !=, >, <,
+ *           LIT_ENTERO, LIT_DECIMAL, LIT_CADENA }
+ *    P  = las producciones listadas arriba
+ *    S  = programa
+ *
+ *  Semántica:
+ *    - cuarto  solo acepta enteros  (Integer)
+ *    - media   acepta decimales; int se promueve a double
+ *    - mega    solo acepta cadenas  (String)
+ *    - Re-declaración PERMITIDA (la variable se sobreescribe)
+ *    - División entre cero → error semántico
+ *    - Mezcla cadena con número en @ → error semántico
+ *    - Operadores ~, #, % con cadenas → error semántico
+ *    - Variable no declarada usada en expresión → error semántico
+ * ================================================================
+ */
+
+package Analizador;
+
+import java_cup.runtime.*;
+import Clases.*;
+import java.util.ArrayList;
+import java.util.List;
+
+/* ================================================================
+   CÓDIGO DEL PARSER
+   ================================================================ */
+parser code {:
+
+    public TablaSimbolos      tabla   = new TablaSimbolos();
+    public List<String>       salida  = new ArrayList<>();
+    public List<ErrorCoronix> errores = new ArrayList<>();
+
+    /* ── Errores sintácticos reportados por CUP ──────────────── */
+    @Override
+    public void report_error(String msg, Object info) {
+        int lin = -1;
+        if (info instanceof Symbol) lin = ((Symbol) info).left;
+        errores.add(new ErrorCoronix(ErrorCoronix.Tipo.SINTACTICO, lin,
+            "Error sintáctico: " + msg));
+    }
+
+    @Override
+    public void report_fatal_error(String msg, Object info) {
+        report_error(msg, info);
+    }
+
+    /* ── Verificación de tipo: esperado vs recibido ────────────── */
+    private boolean chkTipo(String esperado, Object val,
+                             String nombre, int lin) {
+        boolean ok = switch (esperado) {
+            case "cuarto" -> val instanceof Integer;
+            case "media"  -> val instanceof Double;
+            case "mega"   -> val instanceof String;
+            default       -> false;
+        };
+        if (!ok) {
+            String recibido = (val == null) ? "nulo"
+                              : val.getClass().getSimpleName();
+            errores.add(new ErrorCoronix(
+                ErrorCoronix.Tipo.SEMANTICO, lin,
+                "Tipo incorrecto para '" + nombre +
+                "': se esperaba [" + esperado +
+                "] pero se recibió [" + recibido + "]"));
+        }
+        return ok;
+    }
+
+    /* ── Lee el valor de una variable desde la tabla ───────────── */
+    private Object valorDe(String nombre, int lin) {
+        TablaSimbolos.Simbolo s = tabla.obtener(nombre);
+        if (s == null) {
+            errores.add(new ErrorCoronix(
+                ErrorCoronix.Tipo.SEMANTICO, lin,
+                "Variable no declarada: '" + nombre + "'"));
+            return 0;      // valor de emergencia para no propagar null
+        }
+        if (s.valor instanceof Cuarto) return ((Cuarto) s.valor).getValor();
+        if (s.valor instanceof Media)  return ((Media)  s.valor).getValor();
+        if (s.valor instanceof Mega)   return ((Mega)   s.valor).getValor();
+        return s.valor;
+    }
+
+    /* ── Formatea número: evita mostrar ".0" innecesario ─────── */
+    private String fmt(Object v) {
+        if (v instanceof Double d) {
+            if (d == Math.floor(d) && !Double.isInfinite(d))
+                return String.valueOf(d.longValue());
+        }
+        return String.valueOf(v);
+    }
+
+    /* ── Evalúa y registra una condición relacional ────────────── */
+    private boolean evalCond(Object a, String op, Object b, int lin) {
+        if (a instanceof String || b instanceof String) {
+            errores.add(new ErrorCoronix(
+                ErrorCoronix.Tipo.SEMANTICO, lin,
+                "No se puede comparar cadenas con '" + op + "'"));
+            return false;
+        }
+        double da = ((Number) a).doubleValue();
+        double db = ((Number) b).doubleValue();
+        boolean resultado = switch (op) {
+            case ">="  -> da >= db;
+            case "<="  -> da <= db;
+            case "=="  -> da == db;
+            case "!="  -> da != db;
+            case ">"   -> da >  db;
+            case "<"   -> da <  db;
+            default    -> false;
+        };
+        salida.add("  → [L" + lin + "] condición: " +
+            fmt(a) + " " + op + " " + fmt(b) + " → " + resultado);
+        return resultado;
+    }
+:};
+
+/* ================================================================
+   TERMINALES
+   ================================================================ */
+/* Tipos de dato */
+terminal            CUARTO, MEDIA, MEGA;
+/* Control de flujo */
+terminal            IF, TRY, BREAK;
+/* Operadores */
+terminal            ASIGNAR;
+terminal            SUMA, RESTA, MULTIPLICAR, DIVIDIR;
+terminal            FIN;
+/* Relacionales */
+terminal            MAYOR_IGUAL, MENOR_IGUAL, IGUAL_IGUAL, DIFERENTE;
+terminal            MAYOR, MENOR;
+/* Delimitadores */
+terminal            LPAREN, RPAREN;
+terminal            LBRACE, RBRACE;
+/* Literales */
+terminal Integer    LIT_ENTERO;
+terminal Double     LIT_DECIMAL;
+terminal String     LIT_CADENA;
+/* Identificador */
+terminal String     ID;
+
+/* ================================================================
+   NO TERMINALES
+   ================================================================ */
+non terminal          programa;
+non terminal          lista_sent;
+non terminal          sentencia;
+non terminal Object   expr;
+non terminal Boolean  condicion;
+
+/* ================================================================
+   PRECEDENCIA  (menor → mayor prioridad)
+   ================================================================ */
+precedence left SUMA, RESTA;
+precedence left MULTIPLICAR, DIVIDIR;
+precedence left MAYOR_IGUAL, MENOR_IGUAL, IGUAL_IGUAL, DIFERENTE, MAYOR, MENOR;
+
+/* ================================================================
+   GRAMÁTICA
+   ================================================================ */
+start with programa;
+
+programa   ::= lista_sent
+             | /* programa vacío */
+             ;
+
+lista_sent ::= lista_sent sentencia
+             | sentencia
+             ;
+
+/* ── Sentencias ─────────────────────────────────────────────── */
+sentencia ::=
+
+    /* 1. cuarto ID => expr !! */
+    CUARTO:kw ID:nom ASIGNAR expr:val FIN
+    {:
+        int lin = kwleft;
+        if (chkTipo("cuarto", val, nom, lin)) {
+            boolean existia = parser.tabla.existe(nom);
+            Cuarto obj = new Cuarto((Integer) val);
+            parser.tabla.agregar(nom, new TablaSimbolos.Simbolo("cuarto", obj));
+            parser.salida.add("✔ [L" + lin + "] cuarto " + nom + " = " + obj +
+                (existia ? "  [actualizada]" : "  [nueva]"));
+        }
+    :}
+
+    /* 2. media ID => expr !! */
+    | MEDIA:kw ID:nom ASIGNAR expr:val FIN
+    {:
+        int lin = kwleft;
+        if (val instanceof Integer) val = ((Integer) val).doubleValue();
+        if (chkTipo("media", val, nom, lin)) {
+            boolean existia = parser.tabla.existe(nom);
+            Media obj = new Media((Double) val);
+            parser.tabla.agregar(nom, new TablaSimbolos.Simbolo("media", obj));
+            parser.salida.add("✔ [L" + lin + "] media " + nom + " = " + obj +
+                (existia ? "  [actualizada]" : "  [nueva]"));
+        }
+    :}
+
+    /* 3. mega ID => expr !! */
+    | MEGA:kw ID:nom ASIGNAR expr:val FIN
+    {:
+        int lin = kwleft;
+        if (chkTipo("mega", val, nom, lin)) {
+            boolean existia = parser.tabla.existe(nom);
+            Mega obj = new Mega((String) val);
+            parser.tabla.agregar(nom, new TablaSimbolos.Simbolo("mega", obj));
+            parser.salida.add("✔ [L" + lin + "] mega " + nom + " = \"" + obj + "\"" +
+                (existia ? "  [actualizada]" : "  [nueva]"));
+        }
+    :}
+
+    /* 4. cuarto ID => expr !! break  (gramática pizarrón) */
+    | CUARTO:kw ID:nom ASIGNAR expr:val FIN BREAK
+    {:
+        int lin = kwleft;
+        if (chkTipo("cuarto", val, nom, lin)) {
+            boolean existia = parser.tabla.existe(nom);
+            Cuarto obj = new Cuarto((Integer) val);
+            parser.tabla.agregar(nom, new TablaSimbolos.Simbolo("cuarto", obj));
+            parser.salida.add("✔ [L" + lin + "] cuarto " + nom + " = " + obj +
+                (existia ? "  [actualizada]" : "  [nueva]") + "  [break]");
+        }
+    :}
+
+    /* 5. media ID => expr !! break */
+    | MEDIA:kw ID:nom ASIGNAR expr:val FIN BREAK
+    {:
+        int lin = kwleft;
+        if (val instanceof Integer) val = ((Integer) val).doubleValue();
+        if (chkTipo("media", val, nom, lin)) {
+            boolean existia = parser.tabla.existe(nom);
+            Media obj = new Media((Double) val);
+            parser.tabla.agregar(nom, new TablaSimbolos.Simbolo("media", obj));
+            parser.salida.add("✔ [L" + lin + "] media " + nom + " = " + obj +
+                (existia ? "  [actualizada]" : "  [nueva]") + "  [break]");
+        }
+    :}
+
+    /* 6. mega ID => expr !! break */
+    | MEGA:kw ID:nom ASIGNAR expr:val FIN BREAK
+    {:
+        int lin = kwleft;
+        if (chkTipo("mega", val, nom, lin)) {
+            boolean existia = parser.tabla.existe(nom);
+            Mega obj = new Mega((String) val);
+            parser.tabla.agregar(nom, new TablaSimbolos.Simbolo("mega", obj));
+            parser.salida.add("✔ [L" + lin + "] mega " + nom + " = \"" + obj + "\"" +
+                (existia ? "  [actualizada]" : "  [nueva]") + "  [break]");
+        }
+    :}
+
+    /* 7. try { lista_sent } */
+    | TRY:kw LBRACE lista_sent RBRACE
+    {:
+        parser.salida.add("✔ [L" + kwleft + "] bloque try ejecutado");
+    :}
+
+    /* 8. try { }  (bloque vacío) */
+    | TRY:kw LBRACE RBRACE
+    {:
+        parser.salida.add("✔ [L" + kwleft + "] bloque try vacío");
+    :}
+
+    /* 9. if ( condicion ) { lista_sent } */
+    | IF:kw LPAREN condicion:cond RPAREN LBRACE lista_sent RBRACE
+    {:
+        int lin = kwleft;
+        if (Boolean.TRUE.equals(cond)) {
+            parser.salida.add("✔ [L" + lin + "] if → condición VERDADERA, bloque ejecutado");
+        } else {
+            parser.salida.add("✔ [L" + lin + "] if → condición FALSA, bloque omitido");
+        }
+    :}
+
+    /* 10. if ( condicion ) { }  (bloque vacío) */
+    | IF:kw LPAREN condicion:cond RPAREN LBRACE RBRACE
+    {:
+        parser.salida.add("✔ [L" + kwleft + "] if → bloque vacío (cond=" + cond + ")");
+    :}
+
+    /* Recuperación de error: avanza hasta el próximo !! */
+    | error FIN
+    {: /* recuperación — continúa con la siguiente sentencia */ :}
+    ;
+
+/* ================================================================
+   CONDICIÓN RELACIONAL
+   ================================================================ */
+condicion ::=
+
+    expr:a MAYOR_IGUAL:op expr:b
+    {: RESULT = parser.evalCond(a, ">=", b, opleft); :}
+
+    | expr:a MENOR_IGUAL:op expr:b
+    {: RESULT = parser.evalCond(a, "<=", b, opleft); :}
+
+    | expr:a IGUAL_IGUAL:op expr:b
+    {: RESULT = parser.evalCond(a, "==", b, opleft); :}
+
+    | expr:a DIFERENTE:op expr:b
+    {: RESULT = parser.evalCond(a, "!=", b, opleft); :}
+
+    | expr:a MAYOR:op expr:b
+    {: RESULT = parser.evalCond(a, ">",  b, opleft); :}
+
+    | expr:a MENOR:op expr:b
+    {: RESULT = parser.evalCond(a, "<",  b, opleft); :}
+    ;
+
+/* ================================================================
+   EXPRESIONES
+   ================================================================ */
+expr ::=
+
+    /* Literales */
+    LIT_ENTERO:v   {: RESULT = v; :}
+    | LIT_DECIMAL:v {: RESULT = v; :}
+    | LIT_CADENA:v  {: RESULT = v; :}
+
+    /* Variable */
+    | ID:nom
+    {: RESULT = parser.valorDe(nom, nomleft); :}
+
+    /* Paréntesis */
+    | LPAREN expr:e RPAREN
+    {: RESULT = e; :}
+
+    /* @ Suma numérica / Concatenación de cadenas */
+    | expr:a SUMA:op expr:b
+    {:
+        int lin = opleft;
+        if (a instanceof String && b instanceof String) {
+            String r = (String) a + (String) b;
+            parser.salida.add("  → [L"+lin+"] concat: \""+a+"\" @ \""+b+"\" = \""+r+"\"");
+            RESULT = r;
+        } else if (a instanceof String || b instanceof String) {
+            parser.errores.add(new ErrorCoronix(ErrorCoronix.Tipo.SEMANTICO, lin,
+                "No se puede usar '@' entre cadena y número"));
+            RESULT = 0;
+        } else if (a instanceof Integer && b instanceof Integer) {
+            int r = (Integer) a + (Integer) b;
+            parser.salida.add("  → [L"+lin+"] suma: "+a+" @ "+b+" = "+r);
+            RESULT = r;
+        } else {
+            double r = ((Number)a).doubleValue() + ((Number)b).doubleValue();
+            parser.salida.add("  → [L"+lin+"] suma: "+parser.fmt(a)+" @ "+parser.fmt(b)+" = "+parser.fmt(r));
+            RESULT = r;
+        }
+    :}
+
+    /* ~ Resta */
+    | expr:a RESTA:op expr:b
+    {:
+        int lin = opleft;
+        if (a instanceof String || b instanceof String) {
+            parser.errores.add(new ErrorCoronix(ErrorCoronix.Tipo.SEMANTICO, lin,
+                "El operador '~' no está permitido con cadenas"));
+            RESULT = 0;
+        } else if (a instanceof Integer && b instanceof Integer) {
+            int r = (Integer) a - (Integer) b;
+            parser.salida.add("  → [L"+lin+"] resta: "+a+" ~ "+b+" = "+r);
+            RESULT = r;
+        } else {
+            double r = ((Number)a).doubleValue() - ((Number)b).doubleValue();
+            parser.salida.add("  → [L"+lin+"] resta: "+parser.fmt(a)+" ~ "+parser.fmt(b)+" = "+parser.fmt(r));
+            RESULT = r;
+        }
+    :}
+
+    /* # Multiplicación */
+    | expr:a MULTIPLICAR:op expr:b
+    {:
+        int lin = opleft;
+        if (a instanceof String || b instanceof String) {
+            parser.errores.add(new ErrorCoronix(ErrorCoronix.Tipo.SEMANTICO, lin,
+                "El operador '#' no está permitido con cadenas"));
+            RESULT = 0;
+        } else if (a instanceof Integer && b instanceof Integer) {
+            int r = (Integer) a * (Integer) b;
+            parser.salida.add("  → [L"+lin+"] mult: "+a+" # "+b+" = "+r);
+            RESULT = r;
+        } else {
+            double r = ((Number)a).doubleValue() * ((Number)b).doubleValue();
+            parser.salida.add("  → [L"+lin+"] mult: "+parser.fmt(a)+" # "+parser.fmt(b)+" = "+parser.fmt(r));
+            RESULT = r;
+        }
+    :}
+
+    /* % División */
+    | expr:a DIVIDIR:op expr:b
+    {:
+        int lin = opleft;
+        if (a instanceof String || b instanceof String) {
+            parser.errores.add(new ErrorCoronix(ErrorCoronix.Tipo.SEMANTICO, lin,
+                "El operador '%' no está permitido con cadenas"));
+            RESULT = 0;
+        } else {
+            double divisor = ((Number) b).doubleValue();
+            if (divisor == 0.0) {
+                parser.errores.add(new ErrorCoronix(ErrorCoronix.Tipo.SEMANTICO, lin,
+                    "División entre cero no permitida"));
+                RESULT = 0;
+            } else if (a instanceof Integer && b instanceof Integer) {
+                int r = (Integer) a / (Integer) b;
+                parser.salida.add("  → [L"+lin+"] div: "+a+" % "+b+" = "+r);
+                RESULT = r;
+            } else {
+                double r = ((Number)a).doubleValue() / divisor;
+                parser.salida.add("  → [L"+lin+"] div: "+parser.fmt(a)+" % "+parser.fmt(b)+" = "+parser.fmt(r));
+                RESULT = r;
+            }
+        }
+    :}
+    ;
